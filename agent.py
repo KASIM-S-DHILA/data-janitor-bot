@@ -109,7 +109,9 @@ def web_fetch(url: str) -> str:
 
 def python_repl(code: str) -> str:
     try:
+        import builtins
         safe_builtins = {k: v for k, v in ALLOWED_BUILTINS.items()}
+        safe_builtins["__import__"] = builtins.__import__
         safe_globals = {"__builtins__": safe_builtins, "result": None}
         exec(textwrap.dedent(code), safe_globals)
         out = safe_globals.get("result")
