@@ -4,49 +4,61 @@ import re
 import textwrap
 import traceback
 
-import cohere
-from cohere import (
-    Tool,
-    ToolParameterDefinitionsValue,
-    ToolCall,
-    ToolResult,
-)
+from cohere import ClientV2, ToolV2, ToolV2Function
 
 co_client = None
 
-TOOL_DEFS = [
-    Tool(
-        name="web_search",
-        description="Search the web for information. Use this to find MOSPI datasets, reports, and data-analysis sources.",
-        parameter_definitions={
-            "query": ToolParameterDefinitionsValue(
-                description="The search query",
-                type="str",
-                required=True,
-            )
-        },
+TOOLS = [
+    ToolV2(
+        type="function",
+        function=ToolV2Function(
+            name="web_search",
+            description="Search the web for information. Use this to find MOSPI datasets, reports, and data-analysis sources.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query",
+                    }
+                },
+                "required": ["query"],
+            },
+        ),
     ),
-    Tool(
-        name="web_fetch",
-        description="Fetch and read the text content of a web page. Use this to read data tables, reports, or API responses from MOSPI and other public data sources.",
-        parameter_definitions={
-            "url": ToolParameterDefinitionsValue(
-                description="The full URL to fetch",
-                type="str",
-                required=True,
-            )
-        },
+    ToolV2(
+        type="function",
+        function=ToolV2Function(
+            name="web_fetch",
+            description="Fetch and read the text content of a web page. Use this on MOSPI (mospi.gov.in), Census India (censusindia.gov.in), data.gov.in, and similar Indian government sources.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL to fetch",
+                    }
+                },
+                "required": ["url"],
+            },
+        ),
     ),
-    Tool(
-        name="python_repl",
-        description="Execute Python code for data analysis, computation, parsing, or statistics. numpy and pandas are available. Assign the final value to a variable named 'result'. Use print() for debugging.",
-        parameter_definitions={
-            "code": ToolParameterDefinitionsValue(
-                description="Python code to execute",
-                type="str",
-                required=True,
-            )
-        },
+    ToolV2(
+        type="function",
+        function=ToolV2Function(
+            name="python_repl",
+            description="Execute Python code for data analysis, computation, parsing, or statistics. pandas & numpy are available. Assign the final value to a variable named 'result'. Use print() for debugging output.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to execute",
+                    }
+                },
+                "required": ["code"],
+            },
+        ),
     ),
 ]
 
@@ -58,9 +70,10 @@ ALLOWED_BUILTINS = {
     "pow": pow, "print": print, "range": range, "repr": repr,
     "reversed": reversed, "round": round, "set": set,
     "slice": slice, "sorted": sorted, "str": str, "sum": sum,
-    "tuple": tuple, "type": type, "zip": zip, "Exception": Exception,
+    "tuple": tuple, "type": type, "zip": zip,
     "ValueError": ValueError, "TypeError": TypeError, "KeyError": KeyError,
     "IndexError": IndexError, "ZeroDivisionError": ZeroDivisionError,
+    "Exception": Exception,
 }
 
 
@@ -70,7 +83,7 @@ def _init_client():
         api_key = os.environ.get("COHERE_API_KEY") or os.environ.get("CO_API_KEY")
         if not api_key:
             raise ValueError("COHERE_API_KEY environment variable is required")
-        co_client = cohere.Client(api_key=api_key)
+        co_client = ClientV2(api_key=api_key)
 
 
 def web_search(query: str) -> str:
@@ -95,7 +108,10 @@ def web_fetch(url: str) -> str:
     try:
         import httpx
         from bs4 import BeautifulSoup
-        resp = httpx.get(url, timeout=30, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (compatible; DataBot/1.0)"})
+        resp = httpx.get(
+            url, timeout=30, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; DataBot/1.0)"},
+        )
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
         for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
@@ -110,11 +126,11 @@ def web_fetch(url: str) -> str:
 def python_repl(code: str) -> str:
     try:
         import builtins
-        safe_builtins = {k: v for k, v in ALLOWED_BUILTINS.items()}
-        safe_builtins["__import__"] = builtins.__import__
-        safe_globals = {"__builtins__": safe_builtins, "result": None}
-        exec(textwrap.dedent(code), safe_globals)
-        out = safe_globals.get("result")
+        safe = {k: v for k, v in ALLOWED_BUILTINS.items()}
+        safe["__import__"] = builtins.__import__
+        g = {"__builtins__": safe, "result": None}
+        exec(textwrap.dedent(code), g)
+        out = g.get("result")
         if out is not None:
             return str(out)
         return "Code executed. No 'result' variable set."
@@ -152,73 +168,104 @@ def _extract_json(text: str) -> str | None:
 def run_agent(question: str, log_url: str, logger=None) -> str:
     _init_client()
 
-    preamble = (
-        "You are a data analyst AI assistant deployed as a Telegram bot.\n"
-        "Your job is to answer data-analysis questions using the available tools.\n\n"
-        "## Tools\n"
-        "- web_search(query): search the web for information (MOSPI datasets, reports, etc.)\n"
-        "- web_fetch(url): read the text content of a web page. Prefer MOSPI (mospi.gov.in), Census India (censusindia.gov.in), data.gov.in for India data.\n"
-        "- python_repl(code): execute Python code (pandas & numpy available). Use it to parse data and compute answers.\n\n"
-        "## Rules\n"
-        "1. Research thoroughly — prefer MOSPI, Census India, data.gov.in sources.\n"
-        "2. The user's message specifies the EXACT JSON format expected for the answer.\n"
-        "3. Output ONLY the JSON object the question asks for — no markdown, no extra text.\n"
-        f"4. If the answer format includes \"log_url\", use this value: {log_url}\n"
-        "5. Double-check your answer against the source data.\n"
-        f"6. Your log URL is: {log_url}\n"
-        "7. If a tool call fails with the same error twice, try a different approach."
-    )
+    messages: list = [
+        {
+            "role": "system",
+            "content": (
+                "You are a data analyst AI assistant deployed as a Telegram bot.\n"
+                "Answer data-analysis questions using the available tools.\n"
+                "\n"
+                "## Tools\n"
+                "- web_search(query): search the web (MOSPI, Census India, data.gov.in)\n"
+                "- web_fetch(url): read a web page's text content\n"
+                "- python_repl(code): execute Python (pandas & numpy available)\n"
+                "\n"
+                "## Rules\n"
+                "1. Research thoroughly — prefer MOSPI, Census India, data.gov.in sources.\n"
+                "2. The user's message specifies the EXACT JSON format expected.\n"
+                "3. Output ONLY the JSON object — no markdown, no extra text.\n"
+                f"4. If the format includes \"log_url\", use: {log_url}\n"
+                "5. Double-check your answer against the source data.\n"
+                f"6. Your log URL is: {log_url}"
+            ),
+        },
+        {"role": "user", "content": question},
+    ]
 
     if logger:
         logger.log({"event": "start", "question": question[:500]})
 
-    response = co_client.chat(
-        message=question,
-        model="command-r-plus-08-2024",
-        tools=TOOL_DEFS,
-        preamble=preamble,
-        temperature=0.1,
-    )
-
-    repeat_penalty = {}
     for iteration in range(15):
         step = {"iteration": iteration}
 
-        if response.tool_calls:
+        response = co_client.v2.chat(
+            model="command-a-plus-05-2026",
+            messages=messages,
+            tools=TOOLS,
+            temperature=0.1,
+        )
+
+        msg = response.message
+
+        if msg.tool_calls:
             tool_results = []
-            for tc in response.tool_calls:
-                fn_name = tc.name
-                fn_args = tc.parameters
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                try:
+                    fn_args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    fn_args = {}
 
                 step["tool"] = fn_name
                 step["args"] = fn_args
 
                 result = _execute_tool(fn_name, fn_args)
 
-                key = (fn_name, str(fn_args))
-                repeat_penalty[key] = repeat_penalty.get(key, 0) + 1
-
-                if result.startswith("[python error") and repeat_penalty.get(key, 0) >= 2:
-                    result += "\n\n[SYSTEM: This same code keeps failing. Try a different approach or use web_fetch to read data instead.]"
-
                 step["result_preview"] = str(result)[:500]
                 if logger:
                     logger.log(step)
 
-                tool_results.append(
-                    ToolResult(call=tc, outputs=[{"result": result}])
-                )
+                tool_results.append((tc.id, result))
 
-            response = co_client.chat(
-                message="",
-                model="command-r-plus-08-2024",
-                tools=TOOL_DEFS,
-                chat_history=response.chat_history,
-                tool_results=tool_results,
-                temperature=0.1,
-            )
+            assistant_content = None
+            if msg.content:
+                texts = []
+                for c in msg.content:
+                    if hasattr(c, "text") and c.text:
+                        texts.append(c.text)
+                assistant_content = "\n".join(texts) if texts else None
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+
+            for tc_id, result in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": str(result),
+                })
         else:
-            content = response.text or ""
+            content = ""
+            if msg.content:
+                texts = []
+                for c in msg.content:
+                    if hasattr(c, "text") and c.text:
+                        texts.append(c.text)
+                content = "\n".join(texts)
+
             step["response"] = content[:200]
 
             json_str = _extract_json(content)
@@ -231,15 +278,12 @@ def run_agent(question: str, log_url: str, logger=None) -> str:
                 except json.JSONDecodeError:
                     pass
 
-            response = co_client.chat(
-                message="You must output ONLY a valid JSON object matching the format the user originally requested. No markdown, no code fences, no extra text — just the raw JSON.",
-                model="command-r-plus-08-2024",
-                tools=TOOL_DEFS,
-                chat_history=response.chat_history,
-                temperature=0.1,
-            )
+            messages.append({
+                "role": "user",
+                "content": "You must output ONLY a valid JSON object matching the format the user originally requested. No markdown, no code fences, no extra text — just the raw JSON.",
+            })
 
-    fallback = json.dumps({"error": "processing_failed", "detail": "Could not compute answer after multiple attempts"})
+    fallback = json.dumps({"error": "processing_failed", "detail": "Could not compute answer"})
     if logger:
         logger.log({"event": "fallback", "answer": fallback})
     return fallback
