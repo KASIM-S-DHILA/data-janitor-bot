@@ -157,15 +157,16 @@ def run_agent(question: str, log_url: str, logger=None) -> str:
         "Your job is to answer data-analysis questions using the available tools.\n\n"
         "## Tools\n"
         "- web_search(query): search the web for information (MOSPI datasets, reports, etc.)\n"
-        "- web_fetch(url): read the text content of a web page\n"
-        "- python_repl(code): execute Python code (numpy & pandas available)\n\n"
+        "- web_fetch(url): read the text content of a web page. Prefer MOSPI (mospi.gov.in), Census India (censusindia.gov.in), data.gov.in for India data.\n"
+        "- python_repl(code): execute Python code (pandas & numpy available). Use it to parse data and compute answers.\n\n"
         "## Rules\n"
-        "1. Research thoroughly before answering.\n"
+        "1. Research thoroughly — prefer MOSPI, Census India, data.gov.in sources.\n"
         "2. The user's message specifies the EXACT JSON format expected for the answer.\n"
         "3. Output ONLY the JSON object the question asks for — no markdown, no extra text.\n"
         f"4. If the answer format includes \"log_url\", use this value: {log_url}\n"
-        "5. Double-check your answer against the source data before finalizing.\n"
-        f"6. Your log URL is: {log_url}"
+        "5. Double-check your answer against the source data.\n"
+        f"6. Your log URL is: {log_url}\n"
+        "7. If a tool call fails with the same error twice, try a different approach."
     )
 
     if logger:
@@ -179,7 +180,8 @@ def run_agent(question: str, log_url: str, logger=None) -> str:
         temperature=0.1,
     )
 
-    for iteration in range(20):
+    repeat_penalty = {}
+    for iteration in range(15):
         step = {"iteration": iteration}
 
         if response.tool_calls:
@@ -192,6 +194,12 @@ def run_agent(question: str, log_url: str, logger=None) -> str:
                 step["args"] = fn_args
 
                 result = _execute_tool(fn_name, fn_args)
+
+                key = (fn_name, str(fn_args))
+                repeat_penalty[key] = repeat_penalty.get(key, 0) + 1
+
+                if result.startswith("[python error") and repeat_penalty.get(key, 0) >= 2:
+                    result += "\n\n[SYSTEM: This same code keeps failing. Try a different approach or use web_fetch to read data instead.]"
 
                 step["result_preview"] = str(result)[:500]
                 if logger:
@@ -231,7 +239,7 @@ def run_agent(question: str, log_url: str, logger=None) -> str:
                 temperature=0.1,
             )
 
-    fallback = json.dumps({"error": "processing_failed", "detail": "Could not compute answer"})
+    fallback = json.dumps({"error": "processing_failed", "detail": "Could not compute answer after multiple attempts"})
     if logger:
         logger.log({"event": "fallback", "answer": fallback})
     return fallback
